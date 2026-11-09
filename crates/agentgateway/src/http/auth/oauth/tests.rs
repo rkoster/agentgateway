@@ -212,6 +212,71 @@ fn incoming_request() -> crate::http::Request {
 		.unwrap()
 }
 
+fn federated_auth(mock: &MockServer) -> OAuthTokenExchangeAuth {
+	serde_json::from_value(json!({
+		"host": mock.address().to_string(),
+		"path": "/token",
+		"grantType": "federatedClientCredentials",
+		"subjectToken": {"tokenType": TOKEN_TYPE_JWT},
+		"clientAuth": {"method": "clientSecretPost", "clientId": "selected-client"},
+		"scopes": ["https://resource.example/.default"]
+	})).expect("external-assertion client credentials configuration should load")
+}
+
+#[tokio::test]
+async fn federated_client_credentials_sends_external_assertion_not_subject_token() {
+	let mock = mock_token_endpoint(ResponseTemplate::new(200).set_body_json(token_body())).await;
+	let auth = federated_auth(&mock);
+	auth.validate_load().unwrap();
+	let request = auth.build_exchange_request(&incoming_request()).unwrap();
+	fetch_token(&policy_client(), &auth, request).await.unwrap();
+	let params = sent_form_params(&mock).await;
+	assert_eq!(params.len(), 5);
+	assert_eq!(params["grant_type"], "client_credentials");
+	assert_eq!(params["client_id"], "selected-client");
+	assert_eq!(params["client_assertion"], "subj");
+	assert_eq!(params["client_assertion_type"], CLIENT_ASSERTION_TYPE_JWT_BEARER);
+	assert_eq!(params["scope"], "https://resource.example/.default");
+	assert!(mock.received_requests().await.unwrap()[0].headers.get("authorization").is_none());
+}
+
+#[tokio::test]
+async fn federated_client_credentials_replaces_caller_credential_and_caches_by_assertion() {
+	let mock = mock_token_endpoint(ResponseTemplate::new(200).set_body_json(token_body())).await;
+	let auth = federated_auth(&mock);
+	for subject in ["subj", "subj", "another-subject"] {
+		let mut request = incoming_request();
+		request.headers_mut().insert("authorization", format!("Bearer {subject}").parse().unwrap());
+		apply_token_exchange(&backend_info().inputs, &auth, &mut request).await.unwrap();
+		assert_eq!(request.headers()["authorization"], "Bearer upstream-token");
+	}
+	assert_eq!(mock.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn federated_client_credentials_rejects_incompatible_grant_parameters() {
+	let mock = MockServer::start().await;
+	for patch in [
+		json!({"clientAuth": null}),
+		json!({"clientAuth": {"method":"clientSecretPost", "clientId":"selected-client", "clientSecret":"secret"}}),
+		json!({"actorToken": {"source": {"header":"x-actor"}}}),
+		json!({"requestedTokenType": TOKEN_TYPE_ACCESS}),
+		json!({"audiences": ["https://resource.example"]}),
+		json!({"resources": ["https://resource.example"]})
+	] {
+		let mut config = json!({
+			"host": mock.address().to_string(), "path": "/token",
+			"grantType":"federatedClientCredentials",
+			"subjectToken":{"tokenType":TOKEN_TYPE_JWT},
+			"clientAuth":{"method":"clientSecretPost","clientId":"selected-client"}
+		});
+		config.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+		let auth: OAuthTokenExchangeAuth = serde_json::from_value(config).unwrap();
+		assert!(auth.validate_load().is_err(), "incompatible config accepted: {patch}");
+	}
+	assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
 #[test]
 fn missing_subject_token_is_invalid_request() {
 	let auth = auth(Arc::new(SimpleBackendReference::Invalid));
