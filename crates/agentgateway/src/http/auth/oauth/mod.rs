@@ -185,6 +185,23 @@ impl OAuthTokenExchangeAuth {
 				return Err("actor_token is only valid with the token-exchange grant".into());
 			}
 		}
+		if self.grant_type == OAuthGrantType::FederatedClientCredentials {
+			if self.actor_token.is_some()
+				|| self.requested_token_type.is_some()
+				|| !self.audiences.is_empty()
+				|| !self.resources.is_empty()
+			{
+				return Err("federated client credentials does not support actor_token, requested_token_type, audiences or resources".into());
+			}
+			match self.client_auth.as_ref() {
+				Some(OAuthClientAuth { client_id, method: OAuthClientAuthMethod::ClientSecretPost { client_secret: None } })
+					if !client_id.trim().is_empty() => {},
+				_ => return Err("federated client credentials requires clientSecretPost with a non-empty clientId and no clientSecret".into()),
+			}
+			if self.subject_token.token_type != OAuthTokenType::Jwt {
+				return Err("federated client credentials requires a JWT subject token".into());
+			}
+		}
 		if let Some(actor_token) = &self.actor_token {
 			actor_token.validate_load()?;
 		}
@@ -325,7 +342,7 @@ impl OAuthTokenExchangeAuth {
 	fn requested_token_type_param(&self) -> Option<OAuthTokenType> {
 		match self.grant_type {
 			OAuthGrantType::TokenExchange => self.requested_token_type.clone(),
-			OAuthGrantType::JwtBearer => None,
+			OAuthGrantType::JwtBearer | OAuthGrantType::FederatedClientCredentials => None,
 		}
 	}
 
@@ -409,6 +426,11 @@ pub enum OAuthGrantType {
 	TokenExchange,
 	/// RFC 7523; the subject token is sent as the `assertion`.
 	JwtBearer,
+	/// Client credentials authenticated by an externally issued JWT client assertion.
+	/// The subject token is sent as `client_assertion`, not as an authorization grant.
+	/// Requires clientSecretPost with a client ID and no secret. JWT validation and
+	/// authorization of the selected client remain the responsibility of frontend policies.
+	FederatedClientCredentials,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

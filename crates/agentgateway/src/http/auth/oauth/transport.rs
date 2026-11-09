@@ -361,6 +361,12 @@ fn build_token_request_form(
 				.append_pair("grant_type", GRANT_TYPE_JWT_BEARER)
 				.append_pair("assertion", subject_token);
 		},
+		OAuthGrantType::FederatedClientCredentials => {
+			ser
+				.append_pair("grant_type", "client_credentials")
+				.append_pair("client_assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER)
+				.append_pair("client_assertion", subject_token);
+		},
 	}
 	for audience in spec.audiences {
 		ser.append_pair("audience", audience);

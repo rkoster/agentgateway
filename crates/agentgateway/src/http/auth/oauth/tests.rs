@@ -220,7 +220,8 @@ fn federated_auth(mock: &MockServer) -> OAuthTokenExchangeAuth {
 		"subjectToken": {"tokenType": TOKEN_TYPE_JWT},
 		"clientAuth": {"method": "clientSecretPost", "clientId": "selected-client"},
 		"scopes": ["https://resource.example/.default"]
-	})).expect("external-assertion client credentials configuration should load")
+	}))
+	.expect("external-assertion client credentials configuration should load")
 }
 
 #[tokio::test]
@@ -235,9 +236,17 @@ async fn federated_client_credentials_sends_external_assertion_not_subject_token
 	assert_eq!(params["grant_type"], "client_credentials");
 	assert_eq!(params["client_id"], "selected-client");
 	assert_eq!(params["client_assertion"], "subj");
-	assert_eq!(params["client_assertion_type"], CLIENT_ASSERTION_TYPE_JWT_BEARER);
+	assert_eq!(
+		params["client_assertion_type"],
+		CLIENT_ASSERTION_TYPE_JWT_BEARER
+	);
 	assert_eq!(params["scope"], "https://resource.example/.default");
-	assert!(mock.received_requests().await.unwrap()[0].headers.get("authorization").is_none());
+	assert!(
+		mock.received_requests().await.unwrap()[0]
+			.headers
+			.get("authorization")
+			.is_none()
+	);
 }
 
 #[tokio::test]
@@ -246,8 +255,13 @@ async fn federated_client_credentials_replaces_caller_credential_and_caches_by_a
 	let auth = federated_auth(&mock);
 	for subject in ["subj", "subj", "another-subject"] {
 		let mut request = incoming_request();
-		request.headers_mut().insert("authorization", format!("Bearer {subject}").parse().unwrap());
-		apply_token_exchange(&backend_info().inputs, &auth, &mut request).await.unwrap();
+		request.headers_mut().insert(
+			"authorization",
+			format!("Bearer {subject}").parse().unwrap(),
+		);
+		apply_token_exchange(&backend_info().inputs, &auth, &mut request)
+			.await
+			.unwrap();
 		assert_eq!(request.headers()["authorization"], "Bearer upstream-token");
 	}
 	assert_eq!(mock.received_requests().await.unwrap().len(), 2);
@@ -259,10 +273,10 @@ async fn federated_client_credentials_rejects_incompatible_grant_parameters() {
 	for patch in [
 		json!({"clientAuth": null}),
 		json!({"clientAuth": {"method":"clientSecretPost", "clientId":"selected-client", "clientSecret":"secret"}}),
-		json!({"actorToken": {"source": {"header":"x-actor"}}}),
+		json!({"actorToken": {"source": {"header":{"name":"x-actor"}}}}),
 		json!({"requestedTokenType": TOKEN_TYPE_ACCESS}),
 		json!({"audiences": ["https://resource.example"]}),
-		json!({"resources": ["https://resource.example"]})
+		json!({"resources": ["https://resource.example"]}),
 	] {
 		let mut config = json!({
 			"host": mock.address().to_string(), "path": "/token",
@@ -270,9 +284,15 @@ async fn federated_client_credentials_rejects_incompatible_grant_parameters() {
 			"subjectToken":{"tokenType":TOKEN_TYPE_JWT},
 			"clientAuth":{"method":"clientSecretPost","clientId":"selected-client"}
 		});
-		config.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+		config
+			.as_object_mut()
+			.unwrap()
+			.extend(patch.as_object().unwrap().clone());
 		let auth: OAuthTokenExchangeAuth = serde_json::from_value(config).unwrap();
-		assert!(auth.validate_load().is_err(), "incompatible config accepted: {patch}");
+		assert!(
+			auth.validate_load().is_err(),
+			"incompatible config accepted: {patch}"
+		);
 	}
 	assert!(mock.received_requests().await.unwrap().is_empty());
 }
