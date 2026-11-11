@@ -1938,6 +1938,41 @@ mod tests {
 
 	use super::*;
 
+	#[test]
+	fn managed_mcp_grants_materialize_routes_without_broker_storage() {
+		let instance: ConfigResourceKind = "mcp.instance".parse().expect("managed instance kind");
+		let grant: ConfigResourceKind = "mcp.grant".parse().expect("managed grant kind");
+		let route = json!({"name":"binding-route", "gateways":["public"], "backends":[]});
+		let value = json!({"name":"binding", "instance":"instance", "route":route, "metadata":{"owner":"broker"}});
+		assert_eq!(resource_id(grant, &value).unwrap(), "binding");
+		let resources = vec![
+			test_resource(instance, "instance", json!({"name":"instance", "metadata":{"selection":"tools"}})),
+			test_resource(grant, "binding", value),
+		];
+		let rendered = materialize_config("gateways:\n  public:\n    port: 8080\n", &resources).unwrap();
+		let config: Value = serde_norway::from_str(&rendered).unwrap();
+		assert_eq!(config.pointer("/routes/0/name"), Some(&json!("binding-route")));
+		assert!(config.get("mcp").is_none(), "lifecycle metadata is not a global target");
+		let rendered = materialize_config("{}", &resources[..1]).unwrap();
+		let config: Value = serde_norway::from_str(&rendered).unwrap();
+		assert!(config.get("routes").is_none(), "instance alone must not grant access");
+	}
+
+	#[tokio::test]
+	async fn managed_mcp_grants_are_immutable_and_cannot_be_resurrected() {
+		let store = ConfigResourceStore::connect("sqlite::memory:", None).await.unwrap();
+		let DatabasePool::Sqlite(pool) = &store.pool else { unreachable!() };
+		let kind: ConfigResourceKind = "mcp.grant".parse().expect("managed grant kind");
+		let value = json!({"name":"binding", "instance":"instance", "route":{"name":"route"}});
+		let prepared = || prepare_resource(kind, value.clone()).unwrap();
+		upsert_sqlite(&pool, vec![prepared()]).await.unwrap();
+		upsert_sqlite(&pool, vec![prepared()]).await.expect("identical retries succeed");
+		let changed = prepare_resource(kind, json!({"name":"binding", "instance":"instance", "route":{"name":"other"}})).unwrap();
+		assert!(upsert_sqlite(&pool, vec![changed]).await.is_err(), "cannot overwrite grant identity");
+		assert!(delete_sqlite(&pool, kind, "binding").await.unwrap());
+		assert!(upsert_sqlite(&pool, vec![prepared()]).await.is_err(), "delayed create cannot revive deletion");
+	}
+
 	fn test_resource(kind: ConfigResourceKind, id: &str, value: Value) -> ConfigResource {
 		ConfigResource {
 			kind,
