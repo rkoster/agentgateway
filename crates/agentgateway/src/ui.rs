@@ -573,6 +573,15 @@ async fn upsert_config_resources(
 	kind: ConfigResourceKind,
 	mut request: ConfigResourceUpsertRequest,
 ) -> Result<UiConfigResourcesResponse, ErrorResponse> {
+	if app.state.storage.mode == ConfigStoreMode::File
+		&& matches!(
+			kind,
+			ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+		) {
+		return Err(resource_api_error(ConfigResourceError::InvalidRequest(
+			"managed MCP lifecycle resources require database-backed gateway storage".into(),
+		)));
+	}
 	if app.state.storage.mode == ConfigStoreMode::Hybrid && kind.settings_fields().is_some() {
 		let file_config = read_file_config(app).await?;
 		for resource in &mut request.resources {
@@ -626,6 +635,14 @@ async fn update_config_resource(
 	let kind = kind
 		.parse::<ConfigResourceKind>()
 		.map_err(resource_api_error)?;
+	if matches!(
+		kind,
+		ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+	) {
+		return Err(resource_api_error(ConfigResourceError::InvalidRequest(
+			"managed MCP lifecycle resources are immutable; use collection create or DELETE".into(),
+		)));
+	}
 	let file_config = if app.state.storage.mode == ConfigStoreMode::File {
 		Some(read_file_config(&app).await?)
 	} else {
@@ -813,6 +830,14 @@ async fn delete_config_resource(
 
 	let store = app.config_resource_store()?;
 	let resources = store.list(None).await.map_err(resource_api_error)?;
+	if matches!(
+		kind,
+		ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+	) {
+		// Unknown deletes still fence a concurrently delayed initial create.
+		store.delete(kind, &id).await.map_err(resource_api_error)?;
+		return Ok(Json(serde_json::json!({"status":"success"})));
+	}
 	if !resources
 		.iter()
 		.any(|resource| resource.kind == kind && resource.id == id)

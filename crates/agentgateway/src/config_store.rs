@@ -63,6 +63,10 @@ pub enum ConfigResourceKind {
 	LlmPolicy,
 	#[serde(rename = "mcp.target")]
 	McpTarget,
+	#[serde(rename = "mcp.instance")]
+	McpInstance,
+	#[serde(rename = "mcp.grant")]
+	McpGrant,
 	#[serde(rename = "mcp.policy")]
 	McpPolicy,
 	#[serde(rename = "llm.settings")]
@@ -99,6 +103,8 @@ impl ConfigResourceKind {
 			Self::LlmApiKey => "llm.apiKey",
 			Self::LlmPolicy => "llm.policy",
 			Self::McpTarget => "mcp.target",
+			Self::McpInstance => "mcp.instance",
+			Self::McpGrant => "mcp.grant",
 			Self::McpPolicy => "mcp.policy",
 			Self::McpSettings => "mcp.settings",
 			Self::LlmSettings => "llm.settings",
@@ -129,6 +135,8 @@ impl FromStr for ConfigResourceKind {
 			"llm.apiKey" => Ok(Self::LlmApiKey),
 			"llm.policy" => Ok(Self::LlmPolicy),
 			"mcp.target" => Ok(Self::McpTarget),
+			"mcp.instance" => Ok(Self::McpInstance),
+			"mcp.grant" => Ok(Self::McpGrant),
 			"mcp.policy" => Ok(Self::McpPolicy),
 			"mcp.settings" => Ok(Self::McpSettings),
 			"llm.settings" => Ok(Self::LlmSettings),
@@ -389,6 +397,8 @@ fn file_resource_collection(kind: ConfigResourceKind) -> Option<FileResourceColl
 			Some(FileResourceCollection::List(&["llm", "virtualModels"]))
 		},
 		ConfigResourceKind::McpTarget => Some(FileResourceCollection::List(&["mcp", "targets"])),
+		ConfigResourceKind::McpInstance => Some(FileResourceCollection::List(&["mcpInstances"])),
+		ConfigResourceKind::McpGrant => Some(FileResourceCollection::List(&["mcpGrants"])),
 		ConfigResourceKind::LlmPolicy => Some(FileResourceCollection::Map(&["llm", "policies"])),
 		ConfigResourceKind::McpPolicy => Some(FileResourceCollection::Map(&["mcp", "policies"])),
 		ConfigResourceKind::UiPolicy => Some(FileResourceCollection::Map(&["ui", "policies"])),
@@ -452,6 +462,8 @@ pub(crate) fn upsert_file_config_resource(
 		| ConfigResourceKind::LlmVirtualModel
 		| ConfigResourceKind::LlmPolicy
 		| ConfigResourceKind::McpTarget
+		| ConfigResourceKind::McpInstance
+		| ConfigResourceKind::McpGrant
 		| ConfigResourceKind::McpPolicy
 		| ConfigResourceKind::TrafficGateway
 		| ConfigResourceKind::TrafficRoute
@@ -483,6 +495,8 @@ pub(crate) fn delete_file_config_resource(
 		| ConfigResourceKind::LlmVirtualModel
 		| ConfigResourceKind::LlmPolicy
 		| ConfigResourceKind::McpTarget
+		| ConfigResourceKind::McpInstance
+		| ConfigResourceKind::McpGrant
 		| ConfigResourceKind::McpPolicy
 		| ConfigResourceKind::TrafficGateway
 		| ConfigResourceKind::TrafficRoute
@@ -965,6 +979,7 @@ fn overlay_config_resources(
 		matches!(
 			resource.kind,
 			ConfigResourceKind::TrafficGateway
+				| ConfigResourceKind::McpGrant
 				| ConfigResourceKind::TrafficRoute
 				| ConfigResourceKind::TrafficTcpRoute
 		)
@@ -1075,6 +1090,32 @@ fn overlay_config_resources(
 		)?;
 	}
 	if has_traffic_resources {
+		let grants = resources
+			.iter()
+			.filter(|r| r.kind == ConfigResourceKind::McpGrant);
+		for grant in grants {
+			let route = grant
+				.value
+				.get("route")
+				.ok_or_else(|| anyhow::anyhow!("mcp.grant requires route"))?;
+			let instance = grant
+				.value
+				.get("instance")
+				.and_then(Value::as_str)
+				.ok_or_else(|| anyhow::anyhow!("mcp.grant requires instance"))?;
+			if !resources
+				.iter()
+				.any(|r| r.kind == ConfigResourceKind::McpInstance && r.id == instance)
+			{
+				continue; // Deleted parent instances fail closed even on delayed grant writes.
+			}
+			root
+				.entry("routes")
+				.or_insert_with(|| Value::Array(Vec::new()))
+				.as_array_mut()
+				.ok_or_else(|| anyhow::anyhow!("routes must be an array"))?
+				.push(route.clone());
+		}
 		append_traffic_gateways(root, resources)?;
 		append_traffic_routes(root, resources, ConfigResourceKind::TrafficRoute, "routes")?;
 		append_traffic_routes(
@@ -1406,6 +1447,8 @@ fn resource_id(kind: ConfigResourceKind, value: &Value) -> anyhow::Result<String
 		ConfigResourceKind::LlmProvider
 		| ConfigResourceKind::LlmVirtualModel
 		| ConfigResourceKind::McpTarget
+		| ConfigResourceKind::McpInstance
+		| ConfigResourceKind::McpGrant
 		| ConfigResourceKind::TrafficGateway
 		| ConfigResourceKind::TrafficRoute
 		| ConfigResourceKind::TrafficTcpRoute => string_field(value, "name", || {
@@ -1568,6 +1611,26 @@ async fn upsert_sqlite(
 	for PreparedResource { kind, id, value } in prepared {
 		validate_id(&id)?;
 		let now = Utc::now().to_rfc3339();
+		if matches!(
+			kind,
+			ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+		) {
+			let result = sqlx::query("INSERT INTO agw_config_resources (kind,id,value_json,revision,created_at,updated_at,deleted_at) VALUES (?,?,?,1,?,?,NULL) ON CONFLICT(kind,id) DO NOTHING")
+				.bind(kind.as_str()).bind(&id).bind(serde_json::to_string(&value)?).bind(&now).bind(&now).execute(&mut *tx).await?;
+			if result.rows_affected() == 0 {
+				let existing = fetch_sqlite_resource(&mut tx, kind, &id).await?;
+				if !existing.is_some_and(|r| r.value == value) {
+					return Err(
+						ConfigResourceError::Conflict(format!(
+							"immutable resource already exists or was deleted: {kind}/{id}"
+						))
+						.into(),
+					);
+				}
+			}
+			changed.push((kind, id));
+			continue;
+		}
 		sqlx::query(
 			"INSERT INTO agw_config_resources \
 			 (kind, id, value_json, revision, created_at, updated_at, deleted_at) \
@@ -1608,6 +1671,26 @@ async fn upsert_postgres(
 	for PreparedResource { kind, id, value } in prepared {
 		validate_id(&id)?;
 		let now = Utc::now();
+		if matches!(
+			kind,
+			ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+		) {
+			let result = sqlx::query("INSERT INTO agw_config_resources (kind,id,value_json,revision,created_at,updated_at,deleted_at) VALUES ($1,$2,$3,1,$4,$4,NULL) ON CONFLICT(kind,id) DO NOTHING")
+				.bind(kind.as_str()).bind(&id).bind(Json(value.clone())).bind(now).execute(&mut *tx).await?;
+			if result.rows_affected() == 0 {
+				let existing = fetch_postgres_resource(&mut tx, kind, &id).await?;
+				if !existing.is_some_and(|r| r.value == value) {
+					return Err(
+						ConfigResourceError::Conflict(format!(
+							"immutable resource already exists or was deleted: {kind}/{id}"
+						))
+						.into(),
+					);
+				}
+			}
+			changed.push((kind, id));
+			continue;
+		}
 		sqlx::query(
 			"INSERT INTO agw_config_resources \
 			 (kind, id, value_json, revision, created_at, updated_at, deleted_at) \
@@ -1762,9 +1845,22 @@ async fn delete_sqlite(
 ) -> anyhow::Result<bool> {
 	let mut tx = pool.begin().await?;
 	let now = Utc::now().to_rfc3339();
+	if matches!(
+		kind,
+		ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+	) {
+		sqlx::query("INSERT INTO agw_config_resources (kind,id,value_json,revision,created_at,updated_at,deleted_at) VALUES (?,?,'{}',1,?,?,?) ON CONFLICT(kind,id) DO NOTHING")
+			.bind(kind.as_str()).bind(id).bind(&now).bind(&now).bind(&now).execute(&mut *tx).await?;
+	}
 	let deleted = soft_delete_sqlite(&mut tx, kind, id, &now).await?;
 	tx.commit().await?;
-	Ok(deleted)
+	Ok(
+		deleted
+			|| matches!(
+				kind,
+				ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+			),
+	)
 }
 
 async fn soft_delete_sqlite(
@@ -1795,12 +1891,25 @@ async fn delete_postgres(
 ) -> anyhow::Result<bool> {
 	let mut tx = pool.begin().await?;
 	let now = Utc::now();
+	if matches!(
+		kind,
+		ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+	) {
+		sqlx::query("INSERT INTO agw_config_resources (kind,id,value_json,revision,created_at,updated_at,deleted_at) VALUES ($1,$2,'{}',1,$3,$3,$3) ON CONFLICT(kind,id) DO NOTHING")
+			.bind(kind.as_str()).bind(id).bind(now).execute(&mut *tx).await?;
+	}
 	let deleted = soft_delete_postgres(&mut tx, kind, id, now).await?;
 	if deleted {
 		notify_postgres(&mut tx, notification_id).await?;
 	}
 	tx.commit().await?;
-	Ok(deleted)
+	Ok(
+		deleted
+			|| matches!(
+				kind,
+				ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
+			),
+	)
 }
 
 async fn soft_delete_postgres(
@@ -1946,31 +2055,71 @@ mod tests {
 		let value = json!({"name":"binding", "instance":"instance", "route":route, "metadata":{"owner":"broker"}});
 		assert_eq!(resource_id(grant, &value).unwrap(), "binding");
 		let resources = vec![
-			test_resource(instance, "instance", json!({"name":"instance", "metadata":{"selection":"tools"}})),
+			test_resource(
+				instance,
+				"instance",
+				json!({"name":"instance", "metadata":{"selection":"tools"}}),
+			),
 			test_resource(grant, "binding", value),
 		];
-		let rendered = materialize_config("gateways:\n  public:\n    port: 8080\n", &resources).unwrap();
+		let rendered =
+			materialize_config("gateways:\n  public:\n    port: 8080\n", &resources).unwrap();
 		let config: Value = serde_norway::from_str(&rendered).unwrap();
-		assert_eq!(config.pointer("/routes/0/name"), Some(&json!("binding-route")));
-		assert!(config.get("mcp").is_none(), "lifecycle metadata is not a global target");
+		assert_eq!(
+			config.pointer("/routes/0/name"),
+			Some(&json!("binding-route"))
+		);
+		assert!(
+			config.get("mcp").is_none(),
+			"lifecycle metadata is not a global target"
+		);
 		let rendered = materialize_config("{}", &resources[..1]).unwrap();
 		let config: Value = serde_norway::from_str(&rendered).unwrap();
-		assert!(config.get("routes").is_none(), "instance alone must not grant access");
+		assert!(
+			config.get("routes").is_none(),
+			"instance alone must not grant access"
+		);
 	}
 
 	#[tokio::test]
 	async fn managed_mcp_grants_are_immutable_and_cannot_be_resurrected() {
-		let store = ConfigResourceStore::connect("sqlite::memory:", None).await.unwrap();
-		let DatabasePool::Sqlite(pool) = &store.pool else { unreachable!() };
+		let store = ConfigResourceStore::connect("sqlite::memory:", None)
+			.await
+			.unwrap();
+		let DatabasePool::Sqlite(pool) = &store.pool else {
+			unreachable!()
+		};
 		let kind: ConfigResourceKind = "mcp.grant".parse().expect("managed grant kind");
 		let value = json!({"name":"binding", "instance":"instance", "route":{"name":"route"}});
 		let prepared = || prepare_resource(kind, value.clone()).unwrap();
 		upsert_sqlite(&pool, vec![prepared()]).await.unwrap();
-		upsert_sqlite(&pool, vec![prepared()]).await.expect("identical retries succeed");
-		let changed = prepare_resource(kind, json!({"name":"binding", "instance":"instance", "route":{"name":"other"}})).unwrap();
-		assert!(upsert_sqlite(&pool, vec![changed]).await.is_err(), "cannot overwrite grant identity");
+		upsert_sqlite(&pool, vec![prepared()])
+			.await
+			.expect("identical retries succeed");
+		let changed = prepare_resource(
+			kind,
+			json!({"name":"binding", "instance":"instance", "route":{"name":"other"}}),
+		)
+		.unwrap();
+		assert!(
+			upsert_sqlite(&pool, vec![changed]).await.is_err(),
+			"cannot overwrite grant identity"
+		);
 		assert!(delete_sqlite(&pool, kind, "binding").await.unwrap());
-		assert!(upsert_sqlite(&pool, vec![prepared()]).await.is_err(), "delayed create cannot revive deletion");
+		assert!(
+			upsert_sqlite(&pool, vec![prepared()]).await.is_err(),
+			"delayed create cannot revive deletion"
+		);
+		assert!(delete_sqlite(&pool, kind, "never-returned").await.unwrap());
+		let orphan = prepare_resource(
+			kind,
+			json!({"name":"never-returned", "instance":"instance", "route":{"name":"orphan"}}),
+		)
+		.unwrap();
+		assert!(
+			upsert_sqlite(&pool, vec![orphan]).await.is_err(),
+			"orphan cleanup must fence a delayed initial create"
+		);
 	}
 
 	fn test_resource(kind: ConfigResourceKind, id: &str, value: Value) -> ConfigResource {
