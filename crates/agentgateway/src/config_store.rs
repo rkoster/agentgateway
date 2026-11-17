@@ -1364,12 +1364,17 @@ fn overlay_config_resources(
 			{
 				continue; // Deleted parent instances fail closed even on delayed grant writes.
 			}
+			let Some(route) = materialize_mcp_grant(&definitions, &grant.value, route)? else {
+				// An unavailable backend revokes this grant without taking management
+				// and unrelated offerings offline, so operators can still clean it up.
+				continue;
+			};
 			root
 				.entry("routes")
 				.or_insert_with(|| Value::Array(Vec::new()))
 				.as_array_mut()
 				.ok_or_else(|| anyhow::anyhow!("routes must be an array"))?
-				.push(materialize_mcp_grant(&definitions, &grant.value, route)?);
+				.push(route);
 		}
 		append_traffic_gateways(root, resources)?;
 		append_traffic_routes(root, resources, ConfigResourceKind::TrafficRoute, "routes")?;
@@ -2530,9 +2535,15 @@ mod tests {
 		);
 		assert!(config.get("mcpBackends").is_none());
 		let changed = base.to_string().replace("v1", "v2");
-		let rendered = materialize_config(&changed, &resources).expect("incompatible grants must not prevent startup");
+		let rendered = materialize_config(&changed, &resources)
+			.expect("incompatible grants must not prevent startup");
 		let config: Value = serde_norway::from_str(&rendered).unwrap();
-		assert!(config.get("routes").and_then(Value::as_array).is_none_or(|routes| routes.is_empty()));
+		assert!(
+			config
+				.get("routes")
+				.and_then(Value::as_array)
+				.is_none_or(|routes| routes.is_empty())
+		);
 		let listed = file_config_resources(&base, Some(ConfigResourceKind::McpBackend));
 		assert_eq!(listed.len(), 1);
 		assert_eq!(listed[0].id, "tools");
@@ -2546,19 +2557,40 @@ mod tests {
 			"routes":[{"name":"unrelated","backends":[]}],
 			"mcpBackends":[{"name":"tools","revision":"v2","targets":[{"name":"work","mcp":{"host":"https://tools.test"}}]}]
 		});
-		let mut resources = vec![test_resource(ConfigResourceKind::McpInstance,"instance",json!({"name":"instance","metadata":{}}))];
-		for (id, name, revision) in [("compatible","tools","v2"),("incompatible","tools","v1"),("missing","removed","v2")] {
-			resources.push(test_resource(ConfigResourceKind::McpGrant,id,json!({
-				"name":id,"instance":"instance","route":{"name":id,"backends":[]},
-				"backendSelections":[{"name":name,"revision":revision,"parameters":{},"targetPrefix":id}]
-			})));
+		let mut resources = vec![test_resource(
+			ConfigResourceKind::McpInstance,
+			"instance",
+			json!({"name":"instance","metadata":{}}),
+		)];
+		for (id, name, revision) in [
+			("compatible", "tools", "v2"),
+			("incompatible", "tools", "v1"),
+			("missing", "removed", "v2"),
+		] {
+			resources.push(test_resource(
+				ConfigResourceKind::McpGrant,
+				id,
+				json!({
+					"name":id,"instance":"instance","route":{"name":id,"backends":[]},
+					"backendSelections":[{"name":name,"revision":revision,"parameters":{},"targetPrefix":id}]
+				}),
+			));
 		}
-		let rendered = materialize_config(&base.to_string(),&resources).expect("unavailable grants must not block management/cleanup");
+		let rendered = materialize_config(&base.to_string(), &resources)
+			.expect("unavailable grants must not block management/cleanup");
 		let config: Value = serde_norway::from_str(&rendered).unwrap();
-		assert_eq!(config.pointer("/gateways/management/port"),Some(&json!(9090)));
-		assert_eq!(config.pointer("/ui/gateways"),Some(&json!(["management"])));
-		let names: Vec<_> = config["routes"].as_array().unwrap().iter().map(|route| route["name"].as_str().unwrap()).collect();
-		assert_eq!(names,vec!["unrelated","compatible"]);
+		assert_eq!(
+			config.pointer("/gateways/management/port"),
+			Some(&json!(9090))
+		);
+		assert_eq!(config.pointer("/ui/gateways"), Some(&json!(["management"])));
+		let names: Vec<_> = config["routes"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|route| route["name"].as_str().unwrap())
+			.collect();
+		assert_eq!(names, vec!["unrelated", "compatible"]);
 	}
 
 	#[test]

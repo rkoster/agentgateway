@@ -6,22 +6,24 @@ pub(crate) fn materialize_mcp_grant(
 	definitions: &[Value],
 	grant: &Value,
 	route: &Value,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<Option<Value>> {
 	let mut route = route.clone();
 	let Some(selections) = grant.get("backendSelections").and_then(Value::as_array) else {
-		return Ok(route);
+		return Ok(Some(route));
 	};
 	let mut targets = Vec::new();
 	for selection in selections {
-		let definition = definitions
+		let Some(definition) = definitions
 			.iter()
 			.find(|d| d.get("name") == selection.get("name"))
-			.ok_or_else(|| anyhow::anyhow!("MCP backend reference is missing"))?;
-		anyhow::ensure!(
-			definition.get("revision").is_some()
-				&& definition.get("revision") == selection.get("revision"),
-			"MCP backend revision mismatch"
-		);
+		else {
+			return Ok(None);
+		};
+		if definition.get("revision").is_none()
+			|| definition.get("revision") != selection.get("revision")
+		{
+			return Ok(None);
+		}
 		let prefix = selection
 			.get("targetPrefix")
 			.and_then(Value::as_str)
@@ -56,7 +58,7 @@ pub(crate) fn materialize_mcp_grant(
 		}
 	}
 	route["backends"] = serde_json::json!([{"mcp":{"targets": targets}}]);
-	Ok(route)
+	Ok(Some(route))
 }
 
 #[cfg(test)]
@@ -67,15 +69,25 @@ mod tests {
 	#[test]
 	fn unavailable_backend_omits_the_entire_grant_without_aborting_configuration() {
 		let definitions = json!([{"name":"available","revision":"v2","targets":[{"name":"work","mcp":{"host":"https://tools.test"}}]}]);
-		for unavailable in [json!({"name":"missing","revision":"v2"}), json!({"name":"available","revision":"v1"})] {
+		for unavailable in [
+			json!({"name":"missing","revision":"v2"}),
+			json!({"name":"available","revision":"v1"}),
+		] {
 			// A compatible first selection must not result in a partially exposed grant.
 			let mut selection = unavailable;
 			selection["targetPrefix"] = json!("generation");
 			selection["parameters"] = json!({});
 			let grant = json!({"backendSelections":[{"name":"available","revision":"v2","targetPrefix":"generation","parameters":{}},selection]});
-			let route = materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({"name":"unavailable"}))
-				.expect("unavailable grant must not prevent gateway startup");
-			assert!(route.is_none(), "no route from an incompatible grant may be exposed");
+			let route = materialize_mcp_grant(
+				definitions.as_array().unwrap(),
+				&grant,
+				&json!({"name":"unavailable"}),
+			)
+			.expect("unavailable grant must not prevent gateway startup");
+			assert!(
+				route.is_none(),
+				"no route from an incompatible grant may be exposed"
+			);
 		}
 	}
 
@@ -102,15 +114,24 @@ mod tests {
 		);
 		definitions[0]["targets"][0]["policies"]["requestHeaderModifier"]["set"]["X-Key"] =
 			json!("new");
-		let rotated =
-			materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({})).unwrap().unwrap();
+		let rotated = materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({}))
+			.unwrap()
+			.unwrap();
 		assert_eq!(
 			rotated.pointer("/backends/0/mcp/targets/0/policies/requestHeaderModifier/set/X-Key"),
 			Some(&json!("new"))
 		);
 		assert!(!grant.to_string().contains("X-Key"));
 		definitions[0]["revision"] = json!("v2");
-		assert!(materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({})).unwrap().is_none());
-		assert!(materialize_mcp_grant(&[], &grant, &json!({})).unwrap().is_none());
+		assert!(
+			materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({}))
+				.unwrap()
+				.is_none()
+		);
+		assert!(
+			materialize_mcp_grant(&[], &grant, &json!({}))
+				.unwrap()
+				.is_none()
+		);
 	}
 }
