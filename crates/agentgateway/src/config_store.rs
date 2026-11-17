@@ -2463,6 +2463,33 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn managed_mcp_shared_backends_resolve_identity_without_snapshotting_secrets() {
+		let base = json!({"mcpBackends":[{"name":"tools","revision":"v1","targets":[{
+			"name":"work","mcp":{"host":"https://tools.test/mcp"},
+			"policies":{"backendAuth":{"oauthTokenExchange":{"clientAuth":{
+				"clientId":{"fromInstanceParameter":"client_id"}
+			}}}},"requestHeaderModifier":{"set":{"X-Key":"rotatable-secret"}}}
+		}]}]});
+		let resources = vec![
+			test_resource(ConfigResourceKind::McpInstance,"instance",json!({"name":"instance","metadata":{}})),
+			test_resource(ConfigResourceKind::McpGrant,"grant",json!({
+				"name":"grant","instance":"instance","metadata":{},
+				"route":{"name":"binding-route","backends":[]},
+				"backendSelections":[{"name":"tools","revision":"v1","parameters":{"client_id":"selected-client"},"targetPrefix":"binding-generation"}]
+			}))
+		];
+		let rendered = materialize_config(&base.to_string(), &resources).unwrap();
+		let config: Value = serde_norway::from_str(&rendered).unwrap();
+		let target = config.pointer("/routes/0/backends/0/mcp/targets/0").expect("shared target materialized");
+		assert_eq!(target.pointer("/policies/backendAuth/oauthTokenExchange/clientAuth/clientId"),Some(&json!("selected-client")));
+		assert_eq!(target.get("name"),Some(&json!("binding-generation-work")));
+		assert!(!serde_json::to_string(&resources).unwrap().contains("rotatable-secret"));
+		assert!(config.get("mcpBackends").is_none());
+		let changed = base.to_string().replace("v1", "v2");
+		assert!(materialize_config(&changed,&resources).is_err(),"incompatible changes must fail closed");
+	}
+
+	#[test]
 	fn managed_mcp_grants_materialize_routes_without_broker_storage() {
 		let instance: ConfigResourceKind = "mcp.instance".parse().expect("managed instance kind");
 		let grant: ConfigResourceKind = "mcp.grant".parse().expect("managed grant kind");
