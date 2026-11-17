@@ -94,6 +94,8 @@ pub enum ConfigResourceKind {
 	LlmPolicy,
 	#[serde(rename = "mcp.target")]
 	McpTarget,
+	#[serde(rename = "mcp.backend")]
+	McpBackend,
 	#[serde(rename = "mcp.instance")]
 	McpInstance,
 	#[serde(rename = "mcp.grant")]
@@ -119,7 +121,7 @@ pub enum ConfigResourceKind {
 }
 
 impl ConfigResourceKind {
-	pub(crate) const ALL: [Self; 15] = [
+	pub(crate) const ALL: [Self; 16] = [
 		Self::ModelCatalog,
 		Self::LlmProvider,
 		Self::LlmModel,
@@ -127,6 +129,7 @@ impl ConfigResourceKind {
 		Self::LlmApiKey,
 		Self::LlmPolicy,
 		Self::McpTarget,
+		Self::McpBackend,
 		Self::McpPolicy,
 		Self::LlmSettings,
 		Self::McpSettings,
@@ -154,6 +157,7 @@ impl ConfigResourceKind {
 			Self::LlmApiKey => "llm.apiKey",
 			Self::LlmPolicy => "llm.policy",
 			Self::McpTarget => "mcp.target",
+			Self::McpBackend => "mcp.backend",
 			Self::McpInstance => "mcp.instance",
 			Self::McpGrant => "mcp.grant",
 			Self::McpPolicy => "mcp.policy",
@@ -187,6 +191,7 @@ impl FromStr for ConfigResourceKind {
 			"llm.apiKey" => Ok(Self::LlmApiKey),
 			"llm.policy" => Ok(Self::LlmPolicy),
 			"mcp.target" => Ok(Self::McpTarget),
+			"mcp.backend" => Ok(Self::McpBackend),
 			"mcp.instance" => Ok(Self::McpInstance),
 			"mcp.grant" => Ok(Self::McpGrant),
 			"mcp.policy" => Ok(Self::McpPolicy),
@@ -545,6 +550,7 @@ fn file_resource_collection(kind: ConfigResourceKind) -> Option<FileResourceColl
 			Some(FileResourceCollection::List(&["llm", "virtualModels"]))
 		},
 		ConfigResourceKind::McpTarget => Some(FileResourceCollection::List(&["mcp", "targets"])),
+		ConfigResourceKind::McpBackend => Some(FileResourceCollection::List(&["mcpBackends"])),
 		ConfigResourceKind::McpInstance => Some(FileResourceCollection::List(&["mcpInstances"])),
 		ConfigResourceKind::McpGrant => Some(FileResourceCollection::List(&["mcpGrants"])),
 		ConfigResourceKind::LlmPolicy => Some(FileResourceCollection::Map(&["llm", "policies"])),
@@ -658,6 +664,7 @@ pub(crate) fn upsert_file_config_resource(
 		| ConfigResourceKind::LlmVirtualModel
 		| ConfigResourceKind::LlmPolicy
 		| ConfigResourceKind::McpTarget
+		| ConfigResourceKind::McpBackend
 		| ConfigResourceKind::McpInstance
 		| ConfigResourceKind::McpGrant
 		| ConfigResourceKind::McpPolicy
@@ -692,6 +699,7 @@ pub(crate) fn delete_file_config_resource(
 		| ConfigResourceKind::LlmVirtualModel
 		| ConfigResourceKind::LlmPolicy
 		| ConfigResourceKind::McpTarget
+		| ConfigResourceKind::McpBackend
 		| ConfigResourceKind::McpInstance
 		| ConfigResourceKind::McpGrant
 		| ConfigResourceKind::McpPolicy
@@ -1173,6 +1181,9 @@ pub(crate) fn materialize_config(
 ) -> anyhow::Result<String> {
 	let mut config: Value = crate::yaml::from_str(base)?;
 	overlay_config_resources(&mut config, resources)?;
+	if let Some(root) = config.as_object_mut() {
+		root.remove("mcpBackends");
+	}
 	crate::yaml::to_string(&config)
 }
 
@@ -1180,6 +1191,17 @@ fn overlay_config_resources(
 	config: &mut Value,
 	resources: &[ConfigResource],
 ) -> anyhow::Result<()> {
+	let mut definitions = config
+		.get("mcpBackends")
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
+	definitions.extend(
+		resources
+			.iter()
+			.filter(|r| r.kind == ConfigResourceKind::McpBackend)
+			.map(|r| r.value.clone()),
+	);
 	let has_llm_resources = resources.iter().any(|resource| {
 		matches!(
 			resource.kind,
@@ -1347,7 +1369,7 @@ fn overlay_config_resources(
 				.or_insert_with(|| Value::Array(Vec::new()))
 				.as_array_mut()
 				.ok_or_else(|| anyhow::anyhow!("routes must be an array"))?
-				.push(route.clone());
+				.push(materialize_mcp_grant(&definitions, &grant.value, route)?);
 		}
 		append_traffic_gateways(root, resources)?;
 		append_traffic_routes(root, resources, ConfigResourceKind::TrafficRoute, "routes")?;
@@ -1394,6 +1416,10 @@ fn overlay_config_resources(
 	}
 	Ok(())
 }
+
+#[path = "shared_mcp.rs"]
+mod shared_mcp;
+use shared_mcp::materialize_mcp_grant;
 
 fn append_policy_kind(
 	section: &mut serde_json::Map<String, Value>,
@@ -1689,6 +1715,7 @@ fn resource_id(kind: ConfigResourceKind, value: &Value) -> anyhow::Result<String
 		| ConfigResourceKind::LlmVirtualModel
 		| ConfigResourceKind::McpTarget
 		| ConfigResourceKind::McpInstance
+		| ConfigResourceKind::McpBackend
 		| ConfigResourceKind::McpGrant
 		| ConfigResourceKind::TrafficGateway
 		| ConfigResourceKind::TrafficRoute
@@ -2468,25 +2495,45 @@ mod tests {
 			"name":"work","mcp":{"host":"https://tools.test/mcp"},
 			"policies":{"backendAuth":{"oauthTokenExchange":{"clientAuth":{
 				"clientId":{"fromInstanceParameter":"client_id"}
-			}}}},"requestHeaderModifier":{"set":{"X-Key":"rotatable-secret"}}}
+			}}},"requestHeaderModifier":{"set":{"X-Key":"rotatable-secret"}}}
 		}]}]});
 		let resources = vec![
-			test_resource(ConfigResourceKind::McpInstance,"instance",json!({"name":"instance","metadata":{}})),
-			test_resource(ConfigResourceKind::McpGrant,"grant",json!({
-				"name":"grant","instance":"instance","metadata":{},
-				"route":{"name":"binding-route","backends":[]},
-				"backendSelections":[{"name":"tools","revision":"v1","parameters":{"client_id":"selected-client"},"targetPrefix":"binding-generation"}]
-			}))
+			test_resource(
+				ConfigResourceKind::McpInstance,
+				"instance",
+				json!({"name":"instance","metadata":{}}),
+			),
+			test_resource(
+				ConfigResourceKind::McpGrant,
+				"grant",
+				json!({
+					"name":"grant","instance":"instance","metadata":{},
+					"route":{"name":"binding-route","backends":[]},
+					"backendSelections":[{"name":"tools","revision":"v1","parameters":{"client_id":"selected-client"},"targetPrefix":"binding-generation"}]
+				}),
+			),
 		];
 		let rendered = materialize_config(&base.to_string(), &resources).unwrap();
 		let config: Value = serde_norway::from_str(&rendered).unwrap();
-		let target = config.pointer("/routes/0/backends/0/mcp/targets/0").expect("shared target materialized");
-		assert_eq!(target.pointer("/policies/backendAuth/oauthTokenExchange/clientAuth/clientId"),Some(&json!("selected-client")));
-		assert_eq!(target.get("name"),Some(&json!("binding-generation-work")));
-		assert!(!serde_json::to_string(&resources).unwrap().contains("rotatable-secret"));
+		let target = config
+			.pointer("/routes/0/backends/0/mcp/targets/0")
+			.expect("shared target materialized");
+		assert_eq!(
+			target.pointer("/policies/backendAuth/oauthTokenExchange/clientAuth/clientId"),
+			Some(&json!("selected-client"))
+		);
+		assert_eq!(target.get("name"), Some(&json!("binding-generation-work")));
+		assert!(
+			!serde_json::to_string(&resources)
+				.unwrap()
+				.contains("rotatable-secret")
+		);
 		assert!(config.get("mcpBackends").is_none());
 		let changed = base.to_string().replace("v1", "v2");
-		assert!(materialize_config(&changed,&resources).is_err(),"incompatible changes must fail closed");
+		assert!(
+			materialize_config(&changed, &resources).is_err(),
+			"incompatible changes must fail closed"
+		);
 	}
 
 	#[test]
