@@ -63,6 +63,22 @@ pub(crate) fn materialize_mcp_grant(
 mod tests {
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn unavailable_backend_omits_the_entire_grant_without_aborting_configuration() {
+		let definitions = json!([{"name":"available","revision":"v2","targets":[{"name":"work","mcp":{"host":"https://tools.test"}}]}]);
+		for unavailable in [json!({"name":"missing","revision":"v2"}), json!({"name":"available","revision":"v1"})] {
+			// A compatible first selection must not result in a partially exposed grant.
+			let mut selection = unavailable;
+			selection["targetPrefix"] = json!("generation");
+			selection["parameters"] = json!({});
+			let grant = json!({"backendSelections":[{"name":"available","revision":"v2","targetPrefix":"generation","parameters":{}},selection]});
+			let route = materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({"name":"unavailable"}))
+				.expect("unavailable grant must not prevent gateway startup");
+			assert!(route.is_none(), "no route from an incompatible grant may be exposed");
+		}
+	}
+
 	#[test]
 	fn resolves_instance_selection_and_rotates_shared_credentials() {
 		let mut definitions = json!([{"name":"tools","revision":"v1","targets":[{"name":"work","mcp":{"host":"https://tools.test"},"policies":{"backendAuth":{"oauthTokenExchange":{"clientAuth":{"clientId":{"fromInstanceParameter":"client_id"}}}},"requestHeaderModifier":{"set":{"X-Key":"old"}}}}]}]);
@@ -72,6 +88,7 @@ mod tests {
 			&grant,
 			&json!({"name":"route"}),
 		)
+		.unwrap()
 		.unwrap();
 		assert_eq!(
 			route.pointer(
@@ -86,14 +103,14 @@ mod tests {
 		definitions[0]["targets"][0]["policies"]["requestHeaderModifier"]["set"]["X-Key"] =
 			json!("new");
 		let rotated =
-			materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({})).unwrap();
+			materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({})).unwrap().unwrap();
 		assert_eq!(
 			rotated.pointer("/backends/0/mcp/targets/0/policies/requestHeaderModifier/set/X-Key"),
 			Some(&json!("new"))
 		);
 		assert!(!grant.to_string().contains("X-Key"));
 		definitions[0]["revision"] = json!("v2");
-		assert!(materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({})).is_err());
-		assert!(materialize_mcp_grant(&[], &grant, &json!({})).is_err());
+		assert!(materialize_mcp_grant(definitions.as_array().unwrap(), &grant, &json!({})).unwrap().is_none());
+		assert!(materialize_mcp_grant(&[], &grant, &json!({})).unwrap().is_none());
 	}
 }

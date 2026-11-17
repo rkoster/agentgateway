@@ -2530,13 +2530,35 @@ mod tests {
 		);
 		assert!(config.get("mcpBackends").is_none());
 		let changed = base.to_string().replace("v1", "v2");
-		assert!(
-			materialize_config(&changed, &resources).is_err(),
-			"incompatible changes must fail closed"
-		);
+		let rendered = materialize_config(&changed, &resources).expect("incompatible grants must not prevent startup");
+		let config: Value = serde_norway::from_str(&rendered).unwrap();
+		assert!(config.get("routes").and_then(Value::as_array).is_none_or(|routes| routes.is_empty()));
 		let listed = file_config_resources(&base, Some(ConfigResourceKind::McpBackend));
 		assert_eq!(listed.len(), 1);
 		assert_eq!(listed[0].id, "tools");
+	}
+
+	#[test]
+	fn unavailable_mcp_grants_preserve_management_and_unrelated_routes() {
+		let base = json!({
+			"gateways":{"management":{"port":9090},"inference":{"port":8080}},
+			"ui":{"gateways":["management"]},
+			"routes":[{"name":"unrelated","backends":[]}],
+			"mcpBackends":[{"name":"tools","revision":"v2","targets":[{"name":"work","mcp":{"host":"https://tools.test"}}]}]
+		});
+		let mut resources = vec![test_resource(ConfigResourceKind::McpInstance,"instance",json!({"name":"instance","metadata":{}}))];
+		for (id, name, revision) in [("compatible","tools","v2"),("incompatible","tools","v1"),("missing","removed","v2")] {
+			resources.push(test_resource(ConfigResourceKind::McpGrant,id,json!({
+				"name":id,"instance":"instance","route":{"name":id,"backends":[]},
+				"backendSelections":[{"name":name,"revision":revision,"parameters":{},"targetPrefix":id}]
+			})));
+		}
+		let rendered = materialize_config(&base.to_string(),&resources).expect("unavailable grants must not block management/cleanup");
+		let config: Value = serde_norway::from_str(&rendered).unwrap();
+		assert_eq!(config.pointer("/gateways/management/port"),Some(&json!(9090)));
+		assert_eq!(config.pointer("/ui/gateways"),Some(&json!(["management"])));
+		let names: Vec<_> = config["routes"].as_array().unwrap().iter().map(|route| route["name"].as_str().unwrap()).collect();
+		assert_eq!(names,vec!["unrelated","compatible"]);
 	}
 
 	#[test]
