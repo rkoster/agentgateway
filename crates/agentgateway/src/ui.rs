@@ -618,9 +618,28 @@ async fn list_stored_config_resources(
 		.list(kind)
 		.await
 		.map_err(resource_api_error)?;
-	Ok(UiConfigResourcesResponse {
-		resources: resources.into_iter().map(UiConfigResource::from).collect(),
-	})
+	let mut resources: Vec<_> = resources.into_iter().map(UiConfigResource::from).collect();
+	// Shared operator definitions stay in the bootstrap file, while instances
+	// and grants are DB-owned. Brokers need the same definitions used by gateway
+	// materialization, even though the general hybrid API lists stored resources.
+	if matches!(kind, None | Some(ConfigResourceKind::McpBackend))
+		&& app.state.xds.local_config.is_some()
+	{
+		let file_config = read_file_config(app).await?;
+		for backend in
+			crate::config_store::file_config_resources(&file_config, Some(ConfigResourceKind::McpBackend))
+		{
+			if resources.iter().any(|resource| {
+				resource.kind == ConfigResourceKind::McpBackend && resource.id == backend.id
+			}) {
+				return Err(resource_api_error(ConfigResourceError::Conflict(
+					"MCP backend is defined in both file and database configuration".into(),
+				)));
+			}
+			resources.push(UiConfigResource::from(backend));
+		}
+	}
+	Ok(UiConfigResourcesResponse { resources })
 }
 
 async fn read_file_config(app: &App) -> Result<Value, ErrorResponse> {
@@ -1396,19 +1415,48 @@ mod tests {
 		let state = Arc::get_mut(&mut app.state).unwrap();
 		state.storage.mode = ConfigStoreMode::Hybrid;
 		state.xds.local_config = Some(ConfigSource::File(path));
-		app.config_resource_store = Some(crate::config_store::setup(&crate::telemetry::log_store::Config {
-			url: format!("sqlite://{}", dir.path().join("config.db").display()),
-			max_connections: None,
-		}).await.unwrap());
-		let router = router(app.state.clone(), app.model_catalog.clone(), app.config_resource_store.clone(), app.resource_manager.clone(), &EMPTY_ASSETS_DIR);
+		app.config_resource_store = Some(
+			crate::config_store::setup(&crate::telemetry::log_store::Config {
+				url: format!("sqlite://{}", dir.path().join("config.db").display()),
+				max_connections: None,
+			})
+			.await
+			.unwrap(),
+		);
+		let router = router(
+			app.state.clone(),
+			app.model_catalog.clone(),
+			app.config_resource_store.clone(),
+			app.resource_manager.clone(),
+			&EMPTY_ASSETS_DIR,
+		);
 		for uri in ["/api/config/resources/mcp.backend", "/api/config/resources"] {
-			let response = router.clone().oneshot(axum::extract::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
-			assert_eq!(response.status(),StatusCode::OK);
-			let body = axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
+			let response = router
+				.clone()
+				.oneshot(
+					axum::extract::Request::builder()
+						.uri(uri)
+						.body(axum::body::Body::empty())
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_eq!(response.status(), StatusCode::OK);
+			let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+				.await
+				.unwrap();
 			let body: Value = serde_json::from_slice(&body).unwrap();
-			let backend = body["resources"].as_array().unwrap().iter().find(|r| r["id"] == "operator-tools").expect("operator MCP backend must be discoverable in hybrid mode");
+			let backend = body["resources"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.find(|r| r["id"] == "operator-tools")
+				.expect("operator MCP backend must be discoverable in hybrid mode");
 			assert_eq!(backend["value"]["revision"], "v1");
-			assert_eq!(backend["value"]["callerAuth"]["issuer"], "https://issuer.test");
+			assert_eq!(
+				backend["value"]["callerAuth"]["issuer"],
+				"https://issuer.test"
+			);
 		}
 	}
 
