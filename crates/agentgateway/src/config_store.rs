@@ -2534,6 +2534,9 @@ mod tests {
 			materialize_config(&changed, &resources).is_err(),
 			"incompatible changes must fail closed"
 		);
+		let listed = file_config_resources(&base, Some(ConfigResourceKind::McpBackend));
+		assert_eq!(listed.len(), 1);
+		assert_eq!(listed[0].id, "tools");
 	}
 
 	#[test]
