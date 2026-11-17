@@ -1388,6 +1388,31 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn hybrid_resource_api_lists_operator_owned_mcp_backends() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::write(&path, r#"{"mcpBackends":[{"name":"operator-tools","revision":"v1","callerAuth":{"issuer":"https://issuer.test","audiences":["exchange"],"jwks":{"url":"https://issuer.test/keys"}},"targets":[{"name":"work","mcp":{"host":"https://tools.test"}}]}]}"#).unwrap();
+		let mut app = test_app(false);
+		let state = Arc::get_mut(&mut app.state).unwrap();
+		state.storage.mode = ConfigStoreMode::Hybrid;
+		state.xds.local_config = Some(ConfigSource::File(path));
+		app.config_resource_store = Some(crate::config_store::setup(&crate::telemetry::log_store::Config {
+			url: format!("sqlite://{}", dir.path().join("config.db").display()),
+			max_connections: None,
+		}).await.unwrap());
+		let router = router(app.state.clone(), app.model_catalog.clone(), app.config_resource_store.clone(), app.resource_manager.clone(), &EMPTY_ASSETS_DIR);
+		for uri in ["/api/config/resources/mcp.backend", "/api/config/resources"] {
+			let response = router.clone().oneshot(axum::extract::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(),StatusCode::OK);
+			let body = axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
+			let body: Value = serde_json::from_slice(&body).unwrap();
+			let backend = body["resources"].as_array().unwrap().iter().find(|r| r["id"] == "operator-tools").expect("operator MCP backend must be discoverable in hybrid mode");
+			assert_eq!(backend["value"]["revision"], "v1");
+			assert_eq!(backend["value"]["callerAuth"]["issuer"], "https://issuer.test");
+		}
+	}
+
+	#[tokio::test]
 	async fn config_resource_api_does_not_require_client_generations() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("config.yaml");
