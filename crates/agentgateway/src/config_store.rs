@@ -350,6 +350,40 @@ impl ConfigResourceStore {
 		}
 	}
 
+	pub(crate) async fn resource_snapshot(
+		&self,
+		kind: ConfigResourceKind,
+		id: &str,
+	) -> anyhow::Result<Snapshot> {
+		validate_id(id)?;
+		let (generation, resource) = match &self.pool {
+			DatabasePool::Sqlite(pool) => {
+				let mut tx = pool.begin().await?;
+				let generation = sqlx::query_scalar("SELECT generation FROM agw_config_meta WHERE id = 1")
+					.fetch_one(&mut *tx)
+					.await?;
+				let resource = fetch_sqlite_resource(&mut tx, kind, id).await?;
+				tx.commit().await?;
+				(generation, resource)
+			},
+			DatabasePool::Postgres(pool) => {
+				let mut tx = pool
+					.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+					.await?;
+				let generation = sqlx::query_scalar("SELECT generation FROM agw_config_meta WHERE id = 1")
+					.fetch_one(&mut *tx)
+					.await?;
+				let resource = fetch_postgres_resource(&mut tx, kind, id).await?;
+				tx.commit().await?;
+				(generation, resource)
+			},
+		};
+		Ok(Snapshot {
+			resources: resource.into_iter().collect(),
+			generation,
+		})
+	}
+
 	pub(crate) async fn upsert_prepared(
 		&self,
 		prepared: Vec<PreparedResource>,

@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Redirect, Response, Sse};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
 use include_dir::Dir;
@@ -105,7 +105,9 @@ pub fn router(
 		)
 		.route(
 			"/api/config/resources/{kind}/{id}",
-			put(update_config_resource).delete(delete_config_resource),
+			get(get_config_resource)
+				.put(update_config_resource)
+				.delete(delete_config_resource),
 		)
 		// Legacy path
 		.route("/cel", axum::routing::post(handle_cel))
@@ -655,6 +657,24 @@ async fn list_stored_config_resources(
 		resources,
 		generation: Some(snapshot.generation),
 	})
+}
+
+// Even a missing resource returns the snapshot generation so clients can
+// conditionally create it without reading the whole collection.
+async fn get_config_resource(
+	State(app): State<App>,
+	Path((kind, id)): Path<(String, String)>,
+) -> Result<Json<UiConfigResourcesResponse>, ErrorResponse> {
+	let kind = parse_api_kind(&kind)?;
+	let snapshot = app
+		.config_resource_store()?
+		.resource_snapshot(kind, &id)
+		.await
+		.map_err(resource_api_error)?;
+	Ok(Json(UiConfigResourcesResponse {
+		resources: snapshot.resources.into_iter().map(UiConfigResource::from).collect(),
+		generation: Some(snapshot.generation),
+	}))
 }
 
 async fn read_file_config(app: &App) -> Result<Value, ErrorResponse> {
