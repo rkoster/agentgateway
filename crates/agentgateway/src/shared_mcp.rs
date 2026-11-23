@@ -24,6 +24,32 @@ pub(crate) fn materialize_mcp_grant(
 		{
 			return Ok(None);
 		}
+		if definition.get("teamOAuth").and_then(Value::as_bool) == Some(true) {
+			if selections.len() != 1
+				|| grant.pointer("/metadata/instance/backend/auth/method").and_then(Value::as_str)
+					!= Some("team_oauth")
+			{
+				return Ok(None);
+			}
+			let tools = definition.get("allowedTools").and_then(Value::as_array);
+			let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
+				return Ok(None);
+			};
+			let mut rules = Vec::new();
+			for tool in tools {
+				if !tool.is_string() {
+					return Ok(None);
+				}
+				rules.push(format!(
+					r#"mcp.tool.name == {tool} && (mcp.methodName == "tools/list" || mcp.methodName == "tools/call")"#
+				));
+			}
+			route["policies"]["mcpAuthorization"] = serde_json::json!({"rules": rules});
+		} else if grant.pointer("/metadata/instance/backend/auth/method").and_then(Value::as_str)
+			== Some("team_oauth")
+		{
+			return Ok(None);
+		}
 		let prefix = selection
 			.get("targetPrefix")
 			.and_then(Value::as_str)

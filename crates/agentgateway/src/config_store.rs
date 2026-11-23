@@ -100,6 +100,8 @@ pub enum ConfigResourceKind {
 	McpInstance,
 	#[serde(rename = "mcp.grant")]
 	McpGrant,
+	#[serde(rename = "mcp.oauthConnection")]
+	McpOAuthConnection,
 	#[serde(rename = "mcp.policy")]
 	McpPolicy,
 	#[serde(rename = "llm.settings")]
@@ -160,6 +162,7 @@ impl ConfigResourceKind {
 			Self::McpBackend => "mcp.backend",
 			Self::McpInstance => "mcp.instance",
 			Self::McpGrant => "mcp.grant",
+			Self::McpOAuthConnection => "mcp.oauthConnection",
 			Self::McpPolicy => "mcp.policy",
 			Self::McpSettings => "mcp.settings",
 			Self::LlmSettings => "llm.settings",
@@ -194,6 +197,7 @@ impl FromStr for ConfigResourceKind {
 			"mcp.backend" => Ok(Self::McpBackend),
 			"mcp.instance" => Ok(Self::McpInstance),
 			"mcp.grant" => Ok(Self::McpGrant),
+			"mcp.oauthConnection" => Ok(Self::McpOAuthConnection),
 			"mcp.policy" => Ok(Self::McpPolicy),
 			"mcp.settings" => Ok(Self::McpSettings),
 			"llm.settings" => Ok(Self::LlmSettings),
@@ -564,6 +568,7 @@ fn file_resource_collection(kind: ConfigResourceKind) -> Option<FileResourceColl
 		| ConfigResourceKind::LlmApiKey
 		| ConfigResourceKind::McpSettings
 		| ConfigResourceKind::LlmSettings
+		| ConfigResourceKind::McpOAuthConnection
 		| ConfigResourceKind::SessionKey => None,
 	}
 }
@@ -659,6 +664,9 @@ pub(crate) fn upsert_file_config_resource(
 			upsert_file_settings(config, prepared.kind, &prepared.value)
 		},
 		ConfigResourceKind::SessionKey => Err(session_key_file_error()),
+		ConfigResourceKind::McpOAuthConnection => {
+			anyhow::bail!("MCP OAuth connections require hybrid storage")
+		},
 		ConfigResourceKind::LlmProvider
 		| ConfigResourceKind::LlmModel
 		| ConfigResourceKind::LlmVirtualModel
@@ -694,6 +702,9 @@ pub(crate) fn delete_file_config_resource(
 			delete_file_settings(config, kind)
 		},
 		ConfigResourceKind::SessionKey => Err(session_key_file_error()),
+		ConfigResourceKind::McpOAuthConnection => {
+			anyhow::bail!("MCP OAuth connections require hybrid storage")
+		},
 		ConfigResourceKind::LlmProvider
 		| ConfigResourceKind::LlmModel
 		| ConfigResourceKind::LlmVirtualModel
@@ -1722,6 +1733,7 @@ fn resource_id(kind: ConfigResourceKind, value: &Value) -> anyhow::Result<String
 		| ConfigResourceKind::McpInstance
 		| ConfigResourceKind::McpBackend
 		| ConfigResourceKind::McpGrant
+		| ConfigResourceKind::McpOAuthConnection
 		| ConfigResourceKind::TrafficGateway
 		| ConfigResourceKind::TrafficRoute
 		| ConfigResourceKind::TrafficTcpRoute => string_field(value, "name", || {

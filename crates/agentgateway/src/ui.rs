@@ -267,6 +267,8 @@ struct UiConfigResource {
 #[serde(rename_all = "camelCase")]
 struct UiConfigResourcesResponse {
 	resources: Vec<UiConfigResource>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	generation: Option<i64>,
 }
 
 impl From<ConfigResource> for UiConfigResource {
@@ -300,6 +302,7 @@ impl From<PreparedResource> for UiConfigResource {
 impl From<ConfigResourcesResponse> for UiConfigResourcesResponse {
 	fn from(response: ConfigResourcesResponse) -> Self {
 		Self {
+			generation: response.generation,
 			resources: response
 				.resources
 				.into_iter()
@@ -611,14 +614,23 @@ async fn list_stored_config_resources(
 		};
 		return Ok(UiConfigResourcesResponse {
 			resources: resources.into_iter().map(UiConfigResource::from).collect(),
+			generation: None,
 		});
 	}
-	let resources = app
+	let snapshot = app
 		.config_resource_store()?
-		.list(kind)
+		.snapshot(kind)
 		.await
 		.map_err(resource_api_error)?;
-	let mut resources: Vec<_> = resources.into_iter().map(UiConfigResource::from).collect();
+	let mut resources: Vec<_> = snapshot
+		.resources
+		.into_iter()
+		.filter(|r| {
+			kind == Some(ConfigResourceKind::McpOAuthConnection)
+				|| r.kind != ConfigResourceKind::McpOAuthConnection
+		})
+		.map(UiConfigResource::from)
+		.collect();
 	// Shared operator definitions stay in the bootstrap file, while instances
 	// and grants are DB-owned. Brokers need the same definitions used by gateway
 	// materialization, even though the general hybrid API lists stored resources.
@@ -639,7 +651,10 @@ async fn list_stored_config_resources(
 			resources.push(UiConfigResource::from(backend));
 		}
 	}
-	Ok(UiConfigResourcesResponse { resources })
+	Ok(UiConfigResourcesResponse {
+		resources,
+		generation: Some(snapshot.generation),
+	})
 }
 
 async fn read_file_config(app: &App) -> Result<Value, ErrorResponse> {
@@ -651,11 +666,27 @@ async fn upsert_config_resources_by_kind(
 	State(app): State<App>,
 	Extension(auth): Extension<AuthorizationContext>,
 	Path(kind): Path<String>,
+	headers: HeaderMap,
 	Json(request): Json<ConfigResourceUpsertRequest>,
 ) -> Result<Json<UiConfigResourcesResponse>, ErrorResponse> {
 	app.ensure_writable()?;
 	let kind = parse_api_kind(&kind)?;
-	upsert_config_resources(&app, &auth, kind, request, None)
+	let expected = if kind == ConfigResourceKind::McpOAuthConnection {
+		Some(
+			headers
+				.get("if-match")
+				.and_then(|v| v.to_str().ok())
+				.and_then(|v| v.strip_prefix('"')?.strip_suffix('"')?.parse().ok())
+				.ok_or_else(|| {
+					resource_api_error(ConfigResourceError::InvalidRequest(
+						"MCP OAuth writes require a quoted If-Match generation".into(),
+					))
+				})?,
+		)
+	} else {
+		None
+	};
+	upsert_config_resources(&app, &auth, kind, request, expected)
 		.await
 		.map(Json)
 }
@@ -696,6 +727,7 @@ async fn upsert_config_resources(
 		persist_file_config(app, &config).await?;
 		return Ok(UiConfigResourcesResponse {
 			resources: prepared.into_iter().map(UiConfigResource::from).collect(),
+			generation: None,
 		});
 	}
 
@@ -743,6 +775,11 @@ async fn update_config_resource(
 ) -> Result<Json<UiConfigResourcesResponse>, ErrorResponse> {
 	app.ensure_writable()?;
 	let kind = parse_api_kind(&kind)?;
+	if kind == ConfigResourceKind::McpOAuthConnection {
+		return Err(resource_api_error(ConfigResourceError::InvalidRequest(
+			"use the collection endpoint with If-Match for MCP OAuth writes".into(),
+		)));
+	}
 	if matches!(
 		kind,
 		ConfigResourceKind::McpInstance | ConfigResourceKind::McpGrant
@@ -844,6 +881,7 @@ async fn update_file_config_resource(
 	persist_file_config(app, &config).await?;
 	Ok(UiConfigResourcesResponse {
 		resources: vec![UiConfigResource::from(prepared)],
+		generation: None,
 	})
 }
 
